@@ -18,11 +18,16 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include "defines.h"
+
+#ifdef __VMS
+#include <builtins.h>
+#endif
 
 extern UTL intwr(UTL blksize, UTL passnum);
 extern UTL intrd(UTL blksize, UTL passnum);
@@ -162,6 +167,21 @@ int main(int argc, char *argv[]) {
     U32 mask, ret;
 #elif (AMD64_ASM)
     U32 sw_prf = 0;
+#endif
+
+#ifdef __VMS
+    static const char *child_flag = "----";
+    if (argc == 8 && !strcmp(argv[0], child_flag)) {
+	bid	= (U32) atol(argv[1]);
+	passize = (UTL) atol(argv[2]);
+	maxblk	= (UTL) atol(argv[3]);
+	bnum	= (U32) atol(argv[4]);
+	bch	=	     argv[5][0];
+	myptr	= (U32) atol(argv[6]);
+	masterpid = (pid_t) atol(argv[7]);
+	shmkey	= (key_t) masterpid;
+	goto child_skip;
+    }
 #endif
 
     printf("%s%s%s%s%s%s\n",
@@ -338,6 +358,50 @@ int main(int argc, char *argv[]) {
     for(cnt = 0; cnt < 2048; cnt++) shm[cnt] = 0;
     shmdt(shm);
 
+#ifdef __VMS
+    /* call vfork() and execvp() in a loop, passing all params to children */
+    if (nproc > 1) {
+	char *child_argv[9];
+
+	char bid_str[12];
+	char passize_str[12];
+	char maxblk_str[12];
+	char bnum_str[12];
+	char bch_str[2];
+	char myptr_str[12];
+	char masterpid_str[12];
+
+	snprintf(bid_str,	12, "%u", bid);
+	snprintf(passize_str,	12, "%u", passize);
+	snprintf(maxblk_str,	12, "%u", maxblk);
+	snprintf(bnum_str,	12, "%u", bnum);
+	bch_str[0] = bch;
+	bch_str[1] = '\0';
+	snprintf(masterpid_str,	12, "%u", masterpid);
+
+	child_argv[0] = (char *) child_flag;
+	child_argv[1] = bid_str;
+	child_argv[2] = passize_str;
+	child_argv[3] = maxblk_str;
+	child_argv[4] = bnum_str;
+	child_argv[5] = bch_str;
+	child_argv[6] = myptr_str;
+	child_argv[7] = masterpid_str;
+	child_argv[8] = NULL;
+
+	for(cnt = 1; cnt < nproc; cnt++) {
+	    snprintf(myptr_str, 12, "%u", cnt);
+
+	    if (vfork() == 0) {
+		execvp(argv[0], child_argv);
+		/* if we get here, the exec failed */
+		perror("execvp error");
+		_exit(1);
+	    }
+	}
+    }
+child_skip:	/* children join parent here */
+#else
     /* spawn the processes */
     switch(nproc) {
 	case(1):   fproc = 0; break;
@@ -351,6 +415,7 @@ int main(int argc, char *argv[]) {
 	case(256): fproc = 8; break;
     }
     for(cnt = 0; cnt < fproc; cnt++) fork();
+#endif
 
     /* every process initialises itself and attaches the SHM segment to its
      * virtual memory space */
@@ -361,6 +426,9 @@ int main(int argc, char *argv[]) {
     /* now every process except the master stores its PID in the SHM, and in
      * fact obtains a local number used to identify the process further */
     if(mypid != masterpid) {
+#ifdef __VMS
+	shm[myptr] = mypid;
+#else
 	for(cnt = 1; cnt < nproc; cnt++) {
 	    if(shm[cnt] == 0) {
 		shm[cnt] = mypid;
@@ -368,6 +436,7 @@ int main(int argc, char *argv[]) {
 		break;
 	    }
 	}
+#endif
     }
 
     if(mypid == masterpid) {
@@ -379,6 +448,12 @@ int main(int argc, char *argv[]) {
 	    for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 	    if(counter != (nproc - 1)) usleep(100);
 	}
+
+	/* remove the segment, so that it gets cleaned up when everyone exits */
+	if (shmctl(shmid, IPC_RMID, NULL) == -1) {
+	    perror("error deleting shm");
+	}
+
 	/* all the clones are ready, so now the time has come to fight for
 	 * gigabytes, make a start by clearing their flags */
 	for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
@@ -408,6 +483,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    /* sets own time elapsed */
 		    shm[512] = time;
 		    /* collects information from the clones and calculates the
@@ -423,6 +501,9 @@ int main(int argc, char *argv[]) {
 		} else {
 		    /* every clone sets own time elapsed */
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    /* reports to the master */
 		    shm[myptr+256] = 1;
 		    /* waits for a new ride */
@@ -442,6 +523,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -451,6 +535,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -474,6 +561,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -483,6 +573,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -495,6 +588,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[768] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+768];
@@ -504,6 +600,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+768] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -516,6 +615,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1024] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1024];
@@ -525,6 +627,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1024] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -537,6 +642,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1280] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1280];
@@ -546,6 +654,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1280] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -587,6 +698,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -596,6 +710,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -613,6 +730,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -622,6 +742,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -645,6 +768,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -654,6 +780,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -666,6 +795,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[768] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+768];
@@ -675,6 +807,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+768] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -687,6 +822,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1024] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1024];
@@ -696,6 +834,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1024] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -708,6 +849,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1280] = time;
 		    avgtime = 0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1280];
@@ -717,6 +861,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1280] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -765,6 +912,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -774,6 +924,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -797,6 +950,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -806,6 +962,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -835,6 +994,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -844,6 +1006,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -856,6 +1021,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[768] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+768];
@@ -865,6 +1033,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+768] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -877,6 +1048,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1024] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1024];
@@ -886,6 +1060,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1024] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -898,6 +1075,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1280] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1280];
@@ -907,6 +1087,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1280] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -954,6 +1137,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -963,6 +1149,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -986,6 +1175,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -995,6 +1187,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1024,6 +1219,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -1033,6 +1231,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1045,6 +1246,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[768] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+768];
@@ -1054,6 +1258,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+768] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1066,6 +1273,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1024] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1024];
@@ -1075,6 +1285,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1024] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1087,6 +1300,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1280] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1280];
@@ -1096,6 +1312,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1280] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1143,6 +1362,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -1152,6 +1374,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1175,6 +1400,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -1184,6 +1412,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1214,6 +1445,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -1225,6 +1459,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1238,6 +1475,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[768] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+768];
@@ -1249,6 +1489,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+768] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1262,6 +1505,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1024] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1024];
@@ -1273,6 +1519,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1024] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1286,6 +1535,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1280] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1280];
@@ -1297,6 +1549,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1280] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1352,6 +1607,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -1361,6 +1619,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1384,6 +1645,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -1393,6 +1657,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1423,6 +1690,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[512] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+512];
@@ -1434,6 +1704,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+512] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1447,6 +1720,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[768] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+768];
@@ -1458,6 +1734,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+768] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1471,6 +1750,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1024] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1024];
@@ -1482,6 +1764,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1024] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}
@@ -1495,6 +1780,9 @@ int main(int argc, char *argv[]) {
 			for(cnt = 1; cnt < nproc; cnt++) counter += shm[cnt+256];
 			if(counter != (nproc-1)) usleep(100);
 		    }
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[1280] = time;
 		    avgtime = 0.0;
 		    for(cnt = 0; cnt < nproc; cnt++) avgtime += (F64)shm[cnt+1280];
@@ -1506,6 +1794,9 @@ int main(int argc, char *argv[]) {
 		    for(cnt = 1; cnt < nproc; cnt++) shm[cnt+256] = 0;
 		} else {
 		    shm[myptr+1280] = time;
+#ifdef __VMS
+		    __MB();
+#endif
 		    shm[myptr+256] = 1;
 		    while(shm[myptr+256]) usleep(100);
 		}

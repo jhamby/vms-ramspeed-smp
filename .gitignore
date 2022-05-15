@@ -4,3 +4,5 @@ ramsmp
 *.swp
 .*.swo
 .*.swp
+*.obj
+*.exe
