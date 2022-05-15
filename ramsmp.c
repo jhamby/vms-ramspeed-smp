@@ -170,7 +170,10 @@ int main(int argc, char *argv[]) {
 #endif
 
 #ifdef __VMS
+#pragma __pointer_size save
+#pragma __pointer_size 32
     static const char *child_flag = "----";
+#pragma __pointer_size restore
     if (argc == 8 && !strcmp(argv[0], child_flag)) {
 	bid	= (U32) atol(argv[1]);
 	passize = (UTL) atol(argv[2]);
@@ -361,6 +364,8 @@ int main(int argc, char *argv[]) {
 #ifdef __VMS
     /* call vfork() and execvp() in a loop, passing all params to children */
     if (nproc > 1) {
+#pragma __pointer_size save
+#pragma __pointer_size 32
 	char *child_argv[9];
 
 	char bid_str[12];
@@ -388,6 +393,7 @@ int main(int argc, char *argv[]) {
 	child_argv[6] = myptr_str;
 	child_argv[7] = masterpid_str;
 	child_argv[8] = NULL;
+#pragma __pointer_size restore
 
 	for(cnt = 1; cnt < nproc; cnt++) {
 	    snprintf(myptr_str, 12, "%u", cnt);
