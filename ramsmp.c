@@ -159,7 +159,7 @@ int main(int argc, char *argv[]) {
     U32 bmark, cnt;
     S32 ch, shmid;
     F64 avgtime;
-    UTL *shm;
+    volatile UTL *shm;
     pid_t masterpid, mypid;
     key_t shmkey;
 #if (I386_ASM)
@@ -354,9 +354,9 @@ int main(int argc, char *argv[]) {
     /* initialise the future master process and a segment of shared memory */
     shmkey = masterpid = getpid();
     shmid = shmget(shmkey, (sizeof(STL) << 11), IPC_CREAT | 0666);
-    shm = (UTL *) shmat(shmid, 0, 0);
+    shm = (volatile UTL *) shmat(shmid, 0, 0);
     for(cnt = 0; cnt < 2048; cnt++) shm[cnt] = 0;
-    shmdt(shm);
+    shmdt((UTL *) shm);
 
 #ifdef __VMS
     /* call vfork() and execvp() in a loop, passing all params to children */
