@@ -183,6 +183,7 @@ int main(int argc, char *argv[]) {
 	myptr	= (U32) atol(argv[6]);
 	masterpid = (pid_t) atol(argv[7]);
 	shmkey	= (key_t) masterpid;
+	passnum = (passize << 20)/maxblk;
 	goto child_skip;
     }
 #endif
